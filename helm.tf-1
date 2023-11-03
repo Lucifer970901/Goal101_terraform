@@ -1,0 +1,985 @@
+data "azurerm_client_config" "current" {
+}
+data "azurerm_subscription" "primary" {
+}
+
+
+data "azurerm_user_assigned_identity" "managed-identity" {
+    depends_on = [
+      module.kubernetes-cluster
+    ]
+  name                = var.aks-managed-identity-name   #join("-",list(var.kubernetes_cluster_name, "agentpool")) 
+  resource_group_name = var.kubernetes-resource-group-names  #join("_",list(var.resource_group_name, var.kubernetes_cluster_name, var.resource_group_location))
+}
+
+resource "azurerm_role_assignment" "main" {
+  name                 = null
+  description          = null
+  scope                = data.azurerm_subscription.primary.id
+  role_definition_name = "DNS Zone Contributor"
+  principal_id         = data.azurerm_user_assigned_identity.managed-identity.principal_id
+}
+
+
+module "helm-release-nginx-ingress" {
+    depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-nginx-ingress
+    helm-repository = var.helm-repository-nginx-ingress
+    chart-name = var.chart-name-nginx-ingress
+    chart-version = var.chart-version-nginx-ingress
+    create-namespace = var.create-namespace-nginx-ingress
+    namespace = var.namespace-nginx-ingress
+    filename = var.filename-nginx-ingress
+    dynamic-values = {} 
+    runtime-values = {}
+    hosts = null
+    secretName = null
+}
+
+
+module "helm-release-external-dns" {
+    depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool,module.helm-release-nginx-ingress]
+    source = "./modules/helm-release-external-dns"
+    helm-release-name = var.helm-release-name-external-dns
+    helm-repository = var.helm-repository-external-dns
+    chart-name = var.chart-name-external-dns
+    chart-version = var.chart-version-external-dns
+    create-namespace = var.create-namespace-external-dns
+    namespace = var.namespace-external-dns
+    filename = var.filename-external-dns
+    secretName = null
+    hosts = null
+    dynamic-values = var.dynamic-values-external-dns 
+    domainFilters = var.domainFilters
+    runtime-values = {
+      "tenant-id" = {
+        name =  "azure.tenantId"
+        value =  data.azurerm_client_config.current.tenant_id
+      }
+
+      "subscription-id" = {
+        name =  "azure.subscriptionId"
+        value =  data.azurerm_client_config.current.subscription_id
+      }
+
+      "ClientId" = {
+        name = "azure.aadClientId"
+        value = module.service-principal.client-id
+      }
+
+      "ClientSecret" = {
+        name = "azure.aadClientSecret"
+        value = module.service-principal.client-secret
+      }
+      "resource-group" = {
+              name =  "azure.resourceGroup"
+              value =  var.resource_group_name
+      }      
+
+    }
+}
+
+
+# module "helm-release-cluster-autoscaler" {
+#   depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool,module.helm-release-nginx-ingress]
+#     source = "./modules/helm-release"
+#     helm-release-name = var.helm-release-name-cluster-autoscaler
+#     helm-repository = var.helm-repository-cluster-autoscaler
+#     chart-name = var.chart-name-cluster-autoscaler
+#     chart-version = var.chart-version-cluster-autoscaler
+#     create-namespace = var.create-namespace-cluster-autoscaler
+#     namespace = var.namespace-cluster-autoscaler
+#     filename = var.filename-cluster-autoscaler
+#     secretName = null
+#     hosts = null
+#     dynamic-values = var.dynamic-values-cluster-autoscaler 
+#     runtime-values = {
+#       "tenant-id" = {
+#         name =  "azureTenantID"
+#         value =  data.azurerm_client_config.current.tenant_id
+#       }
+
+#       "subscription-id" = {
+#         name =  "azureSubscriptionID"
+#         value =  data.azurerm_client_config.current.subscription_id
+#       }
+
+#       "ClientId" = {
+#         name = "azureClientID"
+#         value = module.service-principal.client-id
+#       }
+
+#       "ClientSecret" = {
+#         name = "azureClientSecret"
+#         value = module.service-principal.client-secret
+#       }
+
+#       "kubernetesclustername" = {
+#         name = "azureClusterName"
+#         value = var.kubernetes_cluster_name
+#       }
+# }
+
+# }
+
+
+module "helm-release-cert-manager" {
+    depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-cert-manager
+    helm-repository = var.helm-repository-cert-manager
+    chart-name = var.chart-name-cert-manager
+    chart-version = var.chart-version-cert-manager
+    create-namespace = var.create-namespace-cert-manager
+    namespace = var.namespace-cert-manager
+    filename = var.filename-cert-manager
+    dynamic-values = var.dynamic-values-cert-manager
+    runtime-values = {}
+    hosts = null
+    secretName = null
+}
+
+
+resource "kubectl_manifest" "clusterissuer" {
+  depends_on = [
+    module.kubernetes-cluster,module.kubernetes-nodepool,module.helm-release-nginx-ingress,module.helm-release-cert-manager
+  ]
+  yaml_body = templatefile("./g101-helm-charts/clusterIssuerAzure.yaml",
+  {
+     cluster-issuer-name = var.cluster-issuer-name
+     subscriptionID = data.azurerm_client_config.current.subscription_id
+     resourceGroupName = var.resource_group_name
+     hostedZoneName = var.public-dns-zone-name
+     user-assigned-identity-id = data.azurerm_user_assigned_identity.managed-identity.id
+
+  }
+  )
+}
+
+resource "kubectl_manifest" "storage-standard" {
+  depends_on = [
+    module.kubernetes-cluster,module.helm-release-nginx-ingress,module.kubernetes-nodepool
+  ]
+  yaml_body = file("./g101-helm-charts/storageAzureStandard.yaml") 
+}
+
+
+module "helm-release-kubernetes-dashboard" {
+    depends_on  = [
+      module.kubernetes-cluster,
+      module.kubernetes-nodepool,
+      module.helm-release-nginx-ingress,
+      module.helm-release-cert-manager,
+      kubectl_manifest.clusterissuer
+      ]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-kubernetes-dashboard
+    helm-repository = var.helm-repository-kubernetes-dashboard
+    chart-name = var.chart-name-kubernetes-dashboard
+    chart-version = var.chart-version-kubernetes-dashboard
+    create-namespace = var.create-namespace-kubernetes-dashboard
+    namespace = var.namespace-kubernetes-dashboard
+    filename = var.filename-kubernetes-dashboard
+    dynamic-values = {}
+    runtime-values = {}
+    secretName = var.secretName-kubernetes-dashboard
+    hosts = var.hosts-kubernetes-dashboard
+}
+
+
+module "helm-release-openldap" {
+    depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-openldap
+    helm-repository = var.helm-repository-openldap
+    chart-name = var.chart-name-openldap
+    chart-version = var.chart-version-openldap
+    create-namespace = var.create-namespace-openldap
+    namespace = var.namespace-openldap
+    filename = var.filename-openldap
+    dynamic-values = {}
+    runtime-values = {}
+    secretName = null
+    hosts = null
+}
+
+# module "helm-release-adminer" {
+#     # depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+#     source = "./modules/helm-release"
+#     helm-release-name = var.helm-release-name-adminer
+#     helm-repository = var.helm-repository-adminer
+#     chart-name = var.chart-name-adminer
+#     chart-version = var.chart-version-adminer
+#     create-namespace = var.create-namespace-adminer
+#     namespace = var.namespace-adminer
+#     filename = var.filename-adminer
+#     dynamic-values = {}
+#     runtime-values = {}
+#     secretName = var.secretName-adminer
+#     hosts = var.hosts-adminer
+# }
+
+module "helm-release-jupyterhub" {
+    depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-jupyterhub
+    helm-repository = var.helm-repository-jupyterhub
+    chart-name = var.chart-name-jupyterhub
+    chart-version = var.chart-version-jupyterhub
+    create-namespace = var.create-namespace-jupyterhub
+    namespace = var.namespace-jupyterhub
+    filename = var.filename-jupyterhub
+    runtime-values = {
+      "mysql-id" = {
+        name =  "hub.db.url"
+        value = "mysql+pymysql://${var.mysql-jupyterhub-username}:${var.mysql-jupyterhub-password}@${module.mysql-servers["mysql-server-alpha"].mysql-hostname}/${var.jupyterhub-mysql-database}"
+      }
+    }
+    dynamic-values = {}
+    secretName = var.secretName-jupyterhub
+    hosts = var.hosts-jupyterhub
+}
+
+resource "kubectl_manifest" "elasticsearch-secret" {
+  depends_on = [
+    module.kubernetes-cluster,module.helm-release-nginx-ingress,module.kubernetes-nodepool
+  ]
+  yaml_body = file("./g101-helm-charts/elasticsearch/keyspec.yaml") 
+}
+
+
+module "helm-release-elasticsearch" {
+   depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool,kubectl_manifest.elasticsearch-secret,module.helm-release-kibana]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-elasticsearch
+    helm-repository = var.helm-repository-elasticsearch
+    chart-name = var.chart-name-elasticsearch
+    chart-version = var.chart-version-elasticsearch
+    create-namespace = var.create-namespace-elasticsearch
+    namespace = var.namespace-elasticsearch
+    filename = var.filename-elasticsearch
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = var.secretName-elasticsearch
+    hosts = var.hosts-elasticsearch
+}
+
+module "helm-release-apache-knox" {
+depends_on = [
+       module.kubernetes-cluster,module.kubernetes-nodepool
+     ]
+
+     source = "./modules/helm-release-apache-knox"
+     helm-release-name = var.helm-release-name-apache-knox
+     helm-repository = var.helm-repository-apache-knox
+     chart-name = var.chart-name-apache-knox
+     chart-version = var.chart-version-apache-knox
+     create-namespace = var.create-namespace-apache-knox
+     namespace = var.namespace-apache-knox
+     filename = var.filename-apache-knox
+     runtime-values = {}
+     dynamic-values = {}
+    #  secretName = var.secretName-apache-knox
+    #  hosts = var.hosts-apache-knox
+
+ }
+
+module "helm-release-kibana" {
+   depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-kibana
+    helm-repository = var.helm-repository-kibana
+    chart-name = var.chart-name-kibana
+    chart-version = var.chart-version-kibana
+    create-namespace = var.create-namespace-kibana
+    namespace = var.namespace-kibana
+    filename = var.filename-kibana
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = var.secretName-kibana
+    hosts = var.hosts-kibana
+}
+
+
+
+
+module "helm-release-ds-values" {
+   depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release-ds-values"
+    helm-release-name = var.helm-release-name-ds-values
+    helm-repository = var.helm-repository-ds-values
+    chart-name = var.chart-name-ds-values
+    chart-version = var.chart-version-ds-values
+    create-namespace = var.create-namespace-ds-values
+    namespace = var.namespace-ds-values
+    filename = var.filename-ds-values
+    runtime-values = {}
+    dynamic-values = {}
+    mysql-server = module.mysql-servers["mysql-server-alpha"].mysql-hostname
+    # mysql-user = var.mysql-alpha-user-ds-values
+    mysql-alpha-user-ds-values = var.mysql-alpha-user-ds-values
+    # mysql-user-password = var.mysql-alpha-user-password-ds-values
+    mysql-alpha-user-password-ds-values = var.mysql-alpha-user-password-ds-values
+    mysql-database = var.mysql-database-ds-values
+    hadoop-hostname = var.hadoop-hostname-ds-values
+    postgres-hostname = module.postgresql-servers["psql-server-airflow"].psql-fqdn
+}
+
+resource "kubectl_manifest" "ldap-secret-airflow" {
+  depends_on = [
+    module.kubernetes-cluster,module.helm-release-nginx-ingress,module.kubernetes-nodepool,module.helm-release-ds-values
+  ]
+  yaml_body = file("./g101-helm-charts/airflow/secret-ldap.yaml") 
+}
+
+#### Airflow helm Module ##########
+
+module "helm-release-airflow" {
+   depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool,module.helm-release-ds-values]
+    source = "./modules/helm-release-2"
+    helm-release-name = var.helm-release-name-airflow
+    helm-repository = var.helm-repository-airflow
+    chart-name = var.chart-name-airflow
+    chart-version = var.chart-version-airflow
+    create-namespace = var.create-namespace-airflow
+    namespace = var.namespace-airflow
+    filename = var.filename-airflow
+    runtime-values = {}
+    dynamic-values = var.dynamic-values-airflow
+    secretName-web = var.secretName-web-airflow
+    hosts-web = var.hosts-web-airflow
+    secretName-flower = var.secretName-flower-airflow
+    hosts-flower = var.hosts-flower-airflow
+}
+
+module "helm-release-minio" {
+   depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-minio
+    helm-repository = var.helm-repository-minio
+    chart-name = var.chart-name-minio
+    chart-version = var.chart-version-minio
+    create-namespace = var.create-namespace-minio
+    namespace = var.namespace-minio
+    filename = var.filename-minio
+    runtime-values = {
+        "connection_string" = {
+        name =  "environment.AZURE_STORAGE_CONNECTION_STRING"
+        value =  module.azure-storage["g101-storage-account"].primary_connection_string
+        }
+        "storage_account_name" = {
+         name =  "accessKey"
+         value =  var.storage_account_name
+       }
+        "storage_accessKey" = {
+         name =  "secretKey"
+         value =  module.azure-storage["g101-storage-account"].primary_access_key
+      }
+    }
+    dynamic-values = {}
+    secretName = var.secretName-minio
+    hosts = var.hosts-minio
+    
+}
+
+module "helm-release-mlflow" {
+   depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-mlflow
+    helm-repository = var.helm-repository-mlflow
+    chart-name = var.chart-name-mlflow
+    chart-version = var.chart-version-mlflow
+    create-namespace = var.create-namespace-mlflow
+    namespace = var.namespace-mlflow
+    filename = var.filename-mlflow
+    runtime-values = {
+      "postgresql-url" = {
+        name = "backend_store_uri"
+        value = "postgresql://${var.postgresql-username}:${var.postgresql-password}@${module.postgresql-servers["psql-server-airflow"].psql-fqdn}:5432/${var.postgresql-database-name}"
+      }
+    }
+    dynamic-values = {}
+    secretName = var.secretName-mlflow
+    hosts = var.hosts-mlflow
+}
+
+
+
+
+module "helm-release-grafana" {
+   depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-grafana
+    helm-repository = var.helm-repository-grafana
+    chart-name = var.chart-name-grafana
+    chart-version = var.chart-version-grafana
+    create-namespace = var.create-namespace-grafana
+    namespace = var.namespace-grafana
+    filename = var.filename-grafana
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = var.secretName-grafana
+    hosts = var.hosts-grafana
+}
+
+module "helm-release-rabbitmq" {
+  depends_on = [
+      module.kubernetes-cluster,module.kubernetes-nodepool
+    ]
+  
+  source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-rabbitmq
+    helm-repository = var.helm-repository-rabbitmq
+    chart-name = var.chart-name-rabbitmq
+    chart-version = var.chart-version-rabbitmq
+    create-namespace = var.create-namespace-rabbitmq
+    namespace = var.namespace-rabbitmq
+    filename = var.filename-rabbitmq
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = var.secretName-rabbitmq
+    hosts = var.hosts-rabbitmq
+}
+
+module "helm-release-rudderstack" {
+   depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-rudderstack
+    helm-repository = var.helm-repository-rudderstack
+    chart-name = var.chart-name-rudderstack
+    chart-version = var.chart-version-rudderstack
+    create-namespace = var.create-namespace-rudderstack
+    namespace = var.namespace-rudderstack
+    filename = var.filename-rudderstack
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = var.secretName-rudderstack
+    hosts = var.hosts-rudderstack
+}
+
+module "helm-release-sparkoperator" {
+   depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-sparkoperator
+    helm-repository = var.helm-repository-sparkoperator
+    chart-name = var.chart-name-sparkoperator
+    chart-version = var.chart-version-sparkoperator
+    create-namespace = var.create-namespace-sparkoperator
+    namespace = var.namespace-sparkoperator
+    filename = var.filename-sparkoperator
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = null
+    hosts = null  
+}
+
+
+
+################# Clickhouse, Clickhouse-operator, ZZookeeper installation #########
+
+resource "kubernetes_namespace" "clickhouse" {
+  metadata { 
+    name =  var.clickhouse-namespace
+  }
+}
+
+
+resource "kubectl_manifest" "zookeeper" {
+  depends_on = [
+    kubernetes_namespace.clickhouse
+  ]
+  yaml_body = file(var.zookeeper-file-path) 
+}
+#####
+resource "kubectl_manifest" "zookeeper_cm" {
+  depends_on = [
+    kubernetes_namespace.clickhouse
+  ]
+  yaml_body = file(var.zookeeper-configmap-path) 
+}
+#####
+resource "kubectl_manifest" "zookeeper-service" {
+  depends_on = [
+    kubernetes_namespace.clickhouse
+  ]
+  yaml_body = file(var.zookeeper-service-file-path) 
+}
+
+resource "kubectl_manifest" "chk_operator" {
+  depends_on = [
+    kubernetes_namespace.clickhouse
+  ]
+  yaml_body = file(var.chk-operator-file-path) 
+}
+
+
+resource "kubectl_manifest" "clickhouse-cluster" {
+  depends_on = [
+   kubernetes_namespace.clickhouse,kubectl_manifest.chk_operator
+  ]
+  yaml_body = templatefile(var.clickhouse-cluster-file-path,
+  { 
+        clickhouse-cluster-name = var.clickhouse-cluster-name
+       replicasCount = var.clickhouse_cluster_replicascount
+       shardsCount = var.clickhouse_cluster_shardscount
+    runtime-values = { 
+    }
+  }
+ )
+}
+
+############################# Clickhouse maninfest ends here ###############
+
+module "helm-release-alpha-ds-filewatcher" {
+   depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-alpha-ds-filewatcher
+    helm-repository = var.helm-repository-alpha-ds-filewatcher
+    chart-name = var.chart-name-alpha-ds-filewatcher
+    chart-version = var.chart-version-alpha-ds-filewatcher
+    create-namespace = var.create-namespace-alpha-ds-filewatcher
+    namespace = var.namespace-alpha-ds-filewatcher
+    filename = var.filename-alpha-ds-filewatcher
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = null
+    hosts = null
+}
+
+########### Internal alsert system helm module ####
+module "helm-release-internalalertsystem" {
+   depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release-encrypted"
+    helm-release-name = var.helm-release-name-internalalertsystem
+    helm-repository = var.helm-repository-internalalertsystem
+    chart-name = var.chart-name-internalalertsystem
+    chart-version = var.chart-version-internalalertsystem
+    create-namespace = var.create-namespace-internalalertsystem
+    namespace = var.namespace-internalalertsystem
+    filename = var.filename-internalalertsystem
+    secret-filename = var.secret-filename-internalalertsystem
+
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = null
+    hosts = null
+}
+
+# module "helm-release-phpldapadmin" {
+#    depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool,module.helm-release-openldap]
+#     source = "./modules/helm-release"
+#     helm-release-name = var.helm-release-name-phpldapadmin
+#     helm-repository = var.helm-repository-phpldapadmin
+#     chart-name = var.chart-name-phpldapadmin
+#     chart-version = var.chart-version-phpldapadmin
+#     create-namespace = var.create-namespace-phpldapadmin
+#     namespace = var.namespace-phpldapadmin
+#     filename = var.filename-phpldapadmin
+#     runtime-values = {}
+#     dynamic-values = {}
+#     secretName = var.secretName-phpldapadmin
+#     hosts = var.hosts-phpldapadmin
+# }
+
+
+module "helm-release-comm-broker" {
+depends_on = [
+      module.kubernetes-cluster,module.kubernetes-nodepool
+    ]
+
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-comm-broker
+    helm-repository = var.helm-repository-comm-broker
+    chart-name = var.chart-name-comm-broker
+    chart-version = var.chart-version-comm-broker
+    create-namespace = var.create-namespace-comm-broker
+    namespace = var.namespace-comm-broker
+    filename = var.filename-comm-broker
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = var.secretName-comm-broker
+    hosts = var.hosts-comm-broker
+}
+
+
+
+
+module "helm-release-adaptor-email-aws" {
+    depends_on = [
+      module.helm-release-rabbitmq, module.helm-release-comm-broker,module.kubernetes-cluster,module.kubernetes-nodepool
+    ]
+    source = "./modules/helm-release-encrypted"
+    helm-release-name = var.helm-release-name-adaptor-email-aws
+    helm-repository = var.helm-repository-adaptor-email-aws
+    chart-name = var.chart-name-adaptor-email-aws
+    chart-version = var.chart-version-adaptor-email-aws
+    create-namespace = var.create-namespace-adaptor-email-aws
+    namespace = var.namespace-adaptor-email-aws
+    filename = var.filename-adaptor-email-aws
+    secret-filename = var.secret-filename-adaptor-email-aws
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = var.secretName-adaptor-email-aws
+    hosts = var.hosts-adaptor-email-aws
+}
+
+# module "helm-release-adaptor-email-sendgrid" {
+#     depends_on = [
+#       module.helm-release-rabbitmq, module.helm-release-comm-broker,module.kubernetes-cluster,module.kubernetes-nodepool
+#     ]
+#     source = "./modules/helm-release-encrypted"
+#     helm-release-name = var.helm-release-name-adaptor-email-sendgrid
+#     helm-repository = var.helm-repository-adaptor-email-sendgrid
+#     chart-name = var.chart-name-adaptor-email-sendgrid
+#     chart-version = var.chart-version-adaptor-email-sendgrid
+#     create-namespace = var.create-namespace-adaptor-email-sendgrid
+#     namespace = var.namespace-adaptor-email-sendgrid
+#     filename = var.filename-adaptor-email-sendgrid
+#     secret-filename = var.secret-filename-adaptor-email-sendgrid
+#     runtime-values = {}
+#     dynamic-values = {}
+#     secretName = var.secretName-adaptor-email-sendgrid
+#     hosts = var.hosts-adaptor-email-sendgrid
+# }
+
+
+module "helm-release-adaptor-sms-aws" {
+    depends_on = [
+      module.helm-release-rabbitmq, module.helm-release-comm-broker,module.kubernetes-cluster,module.kubernetes-nodepool
+    ]
+    source = "./modules/helm-release-encrypted"
+    helm-release-name = var.helm-release-name-adaptor-sms-aws
+    helm-repository = var.helm-repository-adaptor-sms-aws
+    chart-name = var.chart-name-adaptor-sms-aws
+    chart-version = var.chart-version-adaptor-sms-aws
+    create-namespace = var.create-namespace-adaptor-sms-aws
+    namespace = var.namespace-adaptor-sms-aws
+    filename = var.filename-adaptor-sms-aws
+    secret-filename = var.secret-filename-adaptor-sms-aws
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = var.secretName-adaptor-sms-aws
+    hosts = var.hosts-adaptor-sms-aws
+}
+
+module "helm-release-adaptor-sms-msg91" {
+    depends_on = [
+      module.helm-release-rabbitmq, module.helm-release-comm-broker,module.kubernetes-cluster,module.kubernetes-nodepool
+    ]
+    source = "./modules/helm-release-encrypted"
+    helm-release-name = var.helm-release-name-adaptor-sms-msg91
+    helm-repository = var.helm-repository-adaptor-sms-msg91
+    chart-name = var.chart-name-adaptor-sms-msg91
+    chart-version = var.chart-version-adaptor-sms-msg91
+    create-namespace = var.create-namespace-adaptor-sms-msg91
+    namespace = var.namespace-adaptor-sms-msg91
+    filename = var.filename-adaptor-sms-msg91
+    secret-filename = var.secret-filename-adaptor-sms-msg91
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = var.secretName-adaptor-sms-msg91
+    hosts = var.hosts-adaptor-sms-msg91
+}
+
+# module "helm-release-adaptor-sms-twilio" {
+#     depends_on = [
+#       module.helm-release-rabbitmq, module.helm-release-comm-broker,module.kubernetes-cluster,module.kubernetes-nodepool
+#     ]
+#     source = "./modules/helm-release-encrypted"
+#     helm-release-name = var.helm-release-name-adaptor-sms-twilio
+#     helm-repository = var.helm-repository-adaptor-sms-twilio
+#     chart-name = var.chart-name-adaptor-sms-twilio
+#     chart-version = var.chart-version-adaptor-sms-twilio
+#     create-namespace = var.create-namespace-adaptor-sms-twilio
+#     namespace = var.namespace-adaptor-sms-twilio
+#     filename = var.filename-adaptor-sms-twilio
+#     secret-filename = var.secret-filename-adaptor-sms-twilio
+#     runtime-values = {}
+#     dynamic-values = {}
+#     secretName = var.secretName-adaptor-sms-twilio
+#     hosts = var.hosts-adaptor-sms-twilio
+# }
+
+
+module "helm-release-cdn" {
+    depends_on = [
+      module.helm-release-rabbitmq, module.helm-release-comm-broker,module.kubernetes-cluster,module.kubernetes-nodepool
+    ]
+    source = "./modules/helm-release-encrypted"
+    helm-release-name = var.helm-release-name-cdn
+    helm-repository = var.helm-repository-cdn
+    chart-name = var.chart-name-cdn
+    chart-version = var.chart-version-cdn
+    create-namespace = var.create-namespace-cdn
+    namespace = var.namespace-cdn
+    filename = var.filename-cdn
+    secret-filename = var.secret-filename-cdn
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = var.secretName-cdn
+    hosts = var.hosts-cdn
+}
+
+
+module "helm-release-alpha-sso" {
+    depends_on = [
+      module.helm-release-rabbitmq, module.helm-release-comm-broker,module.kubernetes-cluster,module.kubernetes-nodepool
+    ]
+    source = "./modules/helm-release-encrypted"
+    helm-release-name = var.helm-release-name-alpha-sso
+    helm-repository = var.helm-repository-alpha-sso
+    chart-name = var.chart-name-alpha-sso
+    chart-version = var.chart-version-alpha-sso
+    create-namespace = var.create-namespace-alpha-sso
+    namespace = var.namespace-alpha-sso
+    filename = var.filename-alpha-sso
+    secret-filename = var.secret-filename-alpha-sso
+    runtime-values = {
+      "mysql-host-name" = {
+        name = "config.mysql.dbHostName"
+        value = "${module.mysql-servers["mysql-server-alpha"].mysql-hostname}"   
+       }
+
+      "mysql-dp-port" = {
+            name = "config.mysql.dbPort"
+            value = "3306"   
+      }
+      "mysql-dbName" = {
+            name = "config.mysql.dbName"
+            value = "alpha"   
+      }
+    }
+    dynamic-values = {}
+    secretName = var.secretName-alpha-sso
+    hosts = var.hosts-alpha-sso
+}
+
+module "helm-release-alpha-api" {
+    depends_on = [
+      module.helm-release-rabbitmq, module.helm-release-comm-broker,module.kubernetes-cluster,module.kubernetes-nodepool
+    ]
+    source = "./modules/helm-release-encrypted"
+    helm-release-name = var.helm-release-name-alpha-api
+    helm-repository = var.helm-repository-alpha-api
+    chart-name = var.chart-name-alpha-api
+    chart-version = var.chart-version-alpha-api
+    create-namespace = var.create-namespace-alpha-api
+    namespace = var.namespace-alpha-api
+    filename = var.filename-alpha-api
+    secret-filename = var.secret-filename-alpha-api
+    runtime-values = {
+      "mysql-host-name" = {
+        name = "config.mysql.dbHostName"
+        value = "${module.mysql-servers["mysql-server-alpha"].mysql-hostname}"   
+       }
+
+      "mysql-dp-port" = {
+            name = "config.mysql.dbPort"
+            value = "3306"   
+      }
+      "mysql-dbName" = {
+            name = "config.mysql.dbName"
+            value = "alpha"   
+      }
+      
+      "postgresql-host-name" = {
+        name = "config.postgres.dbHostName"
+        value = "${module.postgresql-servers["psql-server-airflow"].psql-fqdn}"   
+       }
+
+       "postgresql-dbName" = {
+            name = "config.postgres.dbName"
+            value = "alpha"   
+      }
+
+      "postgresql-dp-port" = {
+            name = "config.postgres.dbPort"
+            value = "5432"   
+      }
+
+      "elastic-hostname" = {
+        name = "elasticsearch.elasticsearchHostName"
+        value = "elasticsearch-master.elasticsearch"
+      }
+      "elasticsearchPort" = {
+        name = "elasticsearch.elasticsearchPort"
+        value = "9200"
+      }
+
+      
+    }
+    dynamic-values = {}
+    secretName = var.secretName-alpha-api
+    hosts = var.hosts-alpha-api
+}
+
+module "helm-release-alpha-ui" {
+    depends_on = [
+      module.helm-release-rabbitmq, module.helm-release-comm-broker,module.kubernetes-cluster,module.kubernetes-nodepool
+    ]
+    source = "./modules/helm-release-encrypted"
+    helm-release-name = var.helm-release-name-alpha-ui
+    helm-repository = var.helm-repository-alpha-ui
+    chart-name = var.chart-name-alpha-ui
+    chart-version = var.chart-version-alpha-ui
+    create-namespace = var.create-namespace-alpha-ui
+    namespace = var.namespace-alpha-ui
+    filename = var.filename-alpha-ui
+    secret-filename = var.secret-filename-alpha-ui
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = var.secretName-alpha-ui
+    hosts = var.hosts-alpha-ui
+}
+
+module "helm-release-foryou-cid-proxy" {
+         depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+
+    source = "./modules/helm-release-encrypted"
+    helm-release-name = var.helm-release-name-foryou-cid-proxy
+    helm-repository = var.helm-repository-foryou-cid-proxy
+    chart-name = var.chart-name-foryou-cid-proxy
+    chart-version = var.chart-version-foryou-cid-proxy
+    create-namespace = var.create-namespace-foryou-cid-proxy
+    namespace = var.namespace-foryou-cid-proxy
+    filename = var.filename-foryou-cid-proxy
+    secret-filename = var.secret-filename-foryou-cid-proxy
+    runtime-values = {
+      "postgresql-host-name" = {
+        name = "config.pg_db_hostname"
+        value = "${module.postgresql-servers["psql-server-airflow"].psql-fqdn}"   
+       }
+
+       "postgresql-dbName" = {
+            name = "config.pg_db_name"
+            value = "omega"   
+      }
+
+      "postgresql-dp-port" = {
+            name = "config.pg_db_port"
+            value = "5432"   
+      }
+      
+      "postgresql-username" = {
+            name = "config.pg_db_username"
+            value = "omega"   
+      }
+
+      "postgresql-password" = {
+            name = "config.pg_db_password"
+            value = "e4pjeu&LXNz!Au"   
+      }
+
+    }
+    dynamic-values = {}
+    secretName = var.secretName-foryou-cid-proxy
+    hosts = var.hosts-foryou-cid-proxy
+}
+
+
+module "helm-release-foryou-api" {
+  depends_on = [
+    module.helm-release-foryou-cid-proxy,module.kubernetes-cluster,module.kubernetes-nodepool
+  ]
+
+    source = "./modules/helm-release-encrypted"
+    helm-release-name = var.helm-release-name-foryou-api
+    helm-repository = var.helm-repository-foryou-api
+    chart-name = var.chart-name-foryou-api
+    chart-version = var.chart-version-foryou-api
+    create-namespace = var.create-namespace-foryou-api
+    namespace = var.namespace-foryou-api
+    filename = var.filename-foryou-api
+    secret-filename = var.secret-filename-foryou-api
+    runtime-values = {
+      "mysql-host-name" = {
+        name = "config.mysql.dbHostName"
+        value = "${module.mysql-servers["mysql-server-alpha"].mysql-hostname}"   
+       }
+
+      "mysql-dp-port" = {
+            name = "config.mysql.dbPort"
+            value = "3306"   
+      }
+      "mysql-dbName" = {
+            name = "config.mysql.dbName"
+            value = "foryou"   
+      }
+    }
+    dynamic-values = {}
+    secretName = var.secretName-foryou-api
+    hosts = var.hosts-foryou-api
+}
+
+
+module "helm-release-foryou-ui" {
+    depends_on = [
+    module.helm-release-foryou-cid-proxy,module.kubernetes-cluster,module.kubernetes-nodepool
+  ]
+    source = "./modules/helm-release-encrypted"
+    helm-release-name = var.helm-release-name-foryou-ui
+    helm-repository = var.helm-repository-foryou-ui
+    chart-name = var.chart-name-foryou-ui
+    chart-version = var.chart-version-foryou-ui
+    create-namespace = var.create-namespace-foryou-ui
+    namespace = var.namespace-foryou-ui
+    filename = var.filename-foryou-ui
+    secret-filename = var.secret-filename-foryou-ui
+    runtime-values = {}
+    dynamic-values = {}
+    secretName = var.secretName-foryou-ui
+    hosts = var.hosts-foryou-ui
+}
+
+
+module "helm-release-redis-cache" {
+    depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-redis-cache
+    helm-repository = var.helm-repository-redis-cache
+    chart-name = var.chart-name-redis-cache
+    chart-version = var.chart-version-redis-cache
+    create-namespace = var.create-namespace-redis-cache
+    namespace = var.namespace-redis-cache
+    filename = var.filename-redis-cache
+    hosts = var.hosts-redis-cache
+    secretName = var.secretName-redis-cache
+    runtime-values = {}
+    dynamic-values = {}
+}
+
+module "helm-release-redis-session-queue" {
+    depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-redis-session-queue
+    helm-repository = var.helm-repository-redis-session-queue
+    chart-name = var.chart-name-redis-session-queue
+    chart-version = var.chart-version-redis-session-queue
+    create-namespace = var.create-namespace-redis-session-queue
+    namespace = var.namespace-redis-session-queue
+    filename = var.filename-redis-session-queue
+    hosts = var.hosts-redis-session-queue
+    secretName = var.secretName-redis-session-queue
+    runtime-values = {}
+    dynamic-values = {}
+}
+
+module "helm-release-redis-foryou" {
+    depends_on  = [module.kubernetes-cluster,module.kubernetes-nodepool]
+    source = "./modules/helm-release"
+    helm-release-name = var.helm-release-name-redis-foryou
+    helm-repository = var.helm-repository-redis-foryou
+    chart-name = var.chart-name-redis-foryou
+    chart-version = var.chart-version-redis-foryou
+    create-namespace = var.create-namespace-redis-foryou
+    namespace = var.namespace-redis-foryou
+    filename = var.filename-redis-foryou
+    hosts = var.hosts-redis-foryou
+    secretName = var.secretName-redis-foryou
+    runtime-values = {}
+    dynamic-values = {}
+}
+
+
+
